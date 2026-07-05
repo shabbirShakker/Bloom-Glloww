@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Grow / Bloom — Tulips</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #000; overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  #frame { position: fixed; inset: 0; width: 100vw; height: 100vh; background: #000; }
+  #video {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    object-fit: cover;
+    transform: scaleX(-1);
+  }
+  #canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #vignette {
+    position: absolute; inset: 0;
+    pointer-events: none;
+    background: radial-gradient(ellipse at center, rgba(0,0,0,0) 45%, rgba(0,0,0,0.55) 100%);
+    z-index: 4;
+  }
+  #status {
+    position: absolute; bottom: 5%; left: 0; right: 0;
+    text-align: center; z-index: 5; pointer-events: none;
+  }
+  #status span {
+    display: inline-block; padding: 8px 18px; border-radius: 999px;
+    background: rgba(15,15,25,0.45); border: 1px solid rgba(255,255,255,0.08);
+    color: rgba(255,255,255,0.75); font-size: 12px; letter-spacing: 0.08em;
+    text-transform: uppercase; backdrop-filter: blur(6px);
+  }
+  #startBtn {
+    position: absolute; inset: 0; z-index: 10;
+    background: radial-gradient(circle at 50% 40%, #17111f 0%, #05050a 70%);
+    color: #fff; border: none;
+    display: flex; align-items: center; justify-content: center;
+    flex-direction: column; gap: 16px; cursor: pointer; font-size: 15px;
+  }
+  #startBtn strong { font-size: 20px; font-weight: 700; letter-spacing: 0.02em; }
+  #startBtn span.sub { color: rgba(255,255,255,0.5); font-size: 13px; }
+  #startBtn .orb {
+    width: 68px; height: 68px; border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #ffffff, #ffb6d5 45%, #ff7cb0 85%);
+    box-shadow: 0 0 50px rgba(255,150,190,0.55), 0 0 100px rgba(255,255,255,0.25);
+    animation: pulse 2.4s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.08); } }
+</style>
+</head>
+<body>
+<div id="frame">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="canvas"></canvas>
+  <div id="vignette"></div>
+  <div id="status"><span>Show your hands to the camera</span></div>
+  <button id="startBtn">
+    <div class="orb"></div>
+    <strong>Tap to begin</strong>
+    <span class="sub">Allow camera access</span>
+  </button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+<script>
+(function () {
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const frame = document.getElementById('frame');
+  const statusEl = document.getElementById('status').querySelector('span');
+  const startBtn = document.getElementById('startBtn');
+
+  // Cap pixel ratio — full DPR on high-density phone screens is the #1
+  // silent performance killer for canvas-heavy scenes.
+  const DPR = Math.min(window.devicePixelRatio || 1, 1.5);
+
+  let W = 0, H = 0;
+  function sizeCanvas() {
+    const rect = frame.getBoundingClientRect();
+    canvas.width = rect.width * DPR;
+    canvas.height = rect.height * DPR;
+    canvas.style.width = rect.width + 'px';
+    canvas.style.height = rect.height + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    W = rect.width; H = rect.height;
+  }
+  window.addEventListener('resize', sizeCanvas);
+
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+
+  // ---------- Stem / tulip model ----------
+  const NUM_STEMS = 9;
+  const stems = [];
+  function initStems() {
+    stems.length = 0;
+    for (let i = 0; i < NUM_STEMS; i++) {
+      const t = i / (NUM_STEMS - 1);
+      stems.push({
+        baseAngle: -108 + t * 78,
+        angleJitter: (Math.random() - 0.5) * 6,
+        maxLen: 0.48 + Math.random() * 0.66,
+        curLen: 0,
+        sway: Math.random() * Math.PI * 2,
+        swaySpeed: 0.55 + Math.random() * 0.5,
+        bloom: 0,
+        petalSeed: Math.random() * 10,
+        leafSide: Math.random() > 0.5 ? 1 : -1,
+        pinkAmount: 0.25 + Math.random() * 0.65, // how pink vs white this tulip leans
+        tilt: (Math.random() - 0.5) * 0.25,
+      });
+    }
+  }
+  initStems();
+
+  const base = { x: 0.08, y: 0.72 };
+
+  let smoothGrow = 0;
+  let smoothBloom = 0;
+
+  // ---------- Particles ----------
+  const particles = [];
+  function spawnParticle(x, y, pink) {
+    particles.push({
+      x, y,
+      vx: (Math.random() - 0.5) * 0.4,
+      vy: -0.3 - Math.random() * 0.5,
+      life: 0,
+      maxLife: 1.1 + Math.random() * 1.0,
+      size: 1.2 + Math.random() * 2,
+      pink,
+    });
+  }
+  function updateParticles(dt) {
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.life += dt;
+      p.x += p.vx * dt * 60;
+      p.y += p.vy * dt * 60;
+      p.vy -= 0.15 * dt;
+      if (p.life >= p.maxLife) particles.splice(i, 1);
+    }
+  }
+  function drawParticles() {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (const p of particles) {
+      const tt = p.life / p.maxLife;
+      const alpha = (1 - tt) * 0.75;
+      const r = p.size * (1 + tt * 1.4) * 4;
+      const grad = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, r);
+      const c = p.pink ? '330,100%,85%' : '0,0%,100%';
+      grad.addColorStop(0, `hsla(${c},${alpha})`);
+      grad.addColorStop(1, `hsla(${c},0)`);
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // ---------- Ambient dust (cheap, few) ----------
+  const dust = [];
+  for (let i = 0; i < 26; i++) {
+    dust.push({ x: Math.random(), y: Math.random(), r: 0.4 + Math.random() * 1.2, phase: Math.random() * Math.PI * 2, speed: 0.15 + Math.random() * 0.25 });
+  }
+  function drawDust(time) {
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    for (const d of dust) {
+      const x = d.x * W;
+      const y = ((d.y + Math.sin(time * d.speed + d.phase) * 0.01) % 1) * H;
+      const flicker = 0.3 + 0.3 * Math.sin(time * 1.5 + d.phase * 3);
+      ctx.fillStyle = `rgba(210,215,255,${0.10 * flicker})`;
+      ctx.beginPath();
+      ctx.arc(x, y, d.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // ---------- Diamond tracking marker ----------
+  function drawDiamond(x, y, size, alpha, rotation) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(Math.PI / 4 + rotation);
+    ctx.strokeStyle = `rgba(180,205,255,${alpha})`;
+    ctx.lineWidth = 1.2;
+    ctx.strokeRect(-size / 2, -size / 2, size, size);
+    ctx.restore();
+  }
+
+  // ---------- Stem path (computed once per frame per stem) ----------
+  function buildStemPath(stem, growLevel, time, dt) {
+    const angle = (stem.baseAngle + stem.angleJitter) * Math.PI / 180;
+    const dx = Math.cos(angle);
+    const dy = Math.sin(angle);
+    const targetLen = stem.maxLen * growLevel;
+    // snappier easing, framerate-independent
+    const ease = 1 - Math.pow(0.001, dt); // ~fast convergence regardless of dt
+    stem.curLen = lerp(stem.curLen, targetLen, clamp(ease * 6, 0.08, 0.35));
+
+    const bx = base.x * W;
+    const by = base.y * H;
+    const lenPx = stem.curLen * H;
+    const swayAmt = 0.05 + 0.05 * growLevel;
+    const segs = 14;
+
+    const pts = [{ x: bx, y: by }];
+    for (let s = 1; s <= segs; s++) {
+      const f = s / segs;
+      const wobble = Math.sin(time * stem.swaySpeed + stem.sway + f * 4) * swayAmt * f;
+      const px = bx + dx * lenPx * f + (-dy) * wobble * H * 0.06;
+      const py = by + dy * lenPx * f + (dx) * wobble * H * 0.06;
+      pts.push({ x: px, y: py });
+    }
+    return pts;
+  }
+
+  // Cheap "glow" via two extra low-alpha wide strokes instead of a real blur filter
+  function strokeStemGlowAndCrisp(pts) {
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+    ctx.lineWidth = 7;
+    ctx.stroke();
+
+    ctx.strokeStyle = 'rgba(255,210,235,0.9)';
+    ctx.lineWidth = 1.7;
+    ctx.stroke();
+
+    ctx.setLineDash([2, 5]);
+    ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  function drawLeaves(pts, stem, growLevel) {
+    if (pts.length < 6) return;
+    [0.35, 0.62].forEach((frac, idx) => {
+      const i = Math.floor(frac * (pts.length - 1));
+      const p = pts[i];
+      const next = pts[Math.min(i + 1, pts.length - 1)];
+      const dirX = next.x - p.x, dirY = next.y - p.y;
+      const len = Math.hypot(dirX, dirY) || 1;
+      const nx = -dirY / len, ny = dirX / len;
+      const side = stem.leafSide * (idx === 0 ? 1 : -1);
+      const leafLen = 13 * growLevel + 4;
+
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.quadraticCurveTo(
+        p.x + nx * leafLen * side * 0.8 + dirX * 0.3, p.y + ny * leafLen * side * 0.8 + dirY * 0.3,
+        p.x + nx * leafLen * 1.4 * side, p.y + ny * leafLen * 1.4 * side
+      );
+      ctx.quadraticCurveTo(
+        p.x + nx * leafLen * side * 0.8 - dirX * 0.3, p.y + ny * leafLen * side * 0.8 - dirY * 0.3,
+        p.x, p.y
+      );
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(70,140,100,0.5)';
+      ctx.fill();
+    });
+  }
+
+  // ---------- Tulip renderer ----------
+  // A tulip cup made of 3 overlapping rounded petals, upright regardless of
+  // stem angle (like real tulip heads), closed bud -> open cup as bloom -> 1.
+  function drawTulip(x, y, stem) {
+    const bloom = stem.bloom;
+    if (bloom < 0.01 && stem.curLen < 0.03) return;
+
+    const size = 13 + bloom * 24;
+    const openAngle = 0.12 + bloom * 0.55; // how far petals fan apart
+    const petalLen = size * (0.95 + bloom * 0.35);
+    const petalWidth = size * (0.34 + bloom * 0.30);
+    const pink = stem.pinkAmount;
+
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(stem.tilt * 0.3);
+
+    // soft glow halo behind the bloom — cheap single radial gradient
+    if (bloom > 0.03) {
+      const glowR = size * (1.6 + bloom * 1.8);
+      const g = ctx.createRadialGradient(0, -petalLen * 0.3, 0, 0, -petalLen * 0.3, glowR);
+      g.addColorStop(0, `rgba(255,${230 - pink * 60},${240 - pink * 40},${0.55 * bloom})`);
+      g.addColorStop(0.5, `rgba(255,${180 - pink * 60},${210 - pink * 60},${0.22 * bloom})`);
+      g.addColorStop(1, 'rgba(255,200,220,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(0, -petalLen * 0.3, glowR, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // three petals: left, center, right (draw back ones first)
+    const order = [-1, 0, 1].sort((a, b) => Math.abs(b) - Math.abs(a)); // sides first, center on top
+    order.forEach((side) => {
+      drawTulipPetal(side, openAngle, petalLen, petalWidth, pink, bloom);
+    });
+
+    ctx.restore();
+  }
+
+  function drawTulipPetal(side, openAngle, petalLen, petalWidth, pink, bloom) {
+    const rot = side * openAngle;
+    ctx.save();
+    ctx.rotate(rot);
+
+    // petal shape: rounded teardrop pointing up (-y), anchored at origin
+    ctx.beginPath();
+    ctx.moveTo(0, 4);
+    ctx.bezierCurveTo(
+      -petalWidth, -petalLen * 0.25,
+      -petalWidth * 0.75, -petalLen * 0.95,
+      0, -petalLen
+    );
+    ctx.bezierCurveTo(
+      petalWidth * 0.75, -petalLen * 0.95,
+      petalWidth, -petalLen * 0.25,
+      0, 4
+    );
+    ctx.closePath();
+
+    const grad = ctx.createLinearGradient(0, 4, 0, -petalLen);
+    if (pink > 0.5) {
+      grad.addColorStop(0, 'rgba(255,255,255,0.95)');
+      grad.addColorStop(0.55, `rgba(255,${210 - pink * 40},${228 - pink * 60},0.96)`);
+      grad.addColorStop(1, `rgba(255,${150 - pink * 60},${190 - pink * 90},0.97)`);
+    } else {
+      grad.addColorStop(0, 'rgba(255,255,255,0.97)');
+      grad.addColorStop(0.6, 'rgba(255,247,250,0.97)');
+      grad.addColorStop(1, `rgba(255,${225 - pink * 40},${235 - pink * 40},0.95)`);
+    }
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // thin bright edge highlight, cheap (no shadowBlur)
+    ctx.lineWidth = 0.8;
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+    ctx.stroke();
+
+    ctx.restore();
+
+    if (bloom > 0.4 && Math.random() < bloom * 0.01) {
+      // handled by caller via spawnParticle for performance (kept out here)
+    }
+  }
+
+  function drawLabel(text, x, y, color) {
+    ctx.font = '600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+    const padX = 8, h = 18;
+    const w = ctx.measureText(text).width + padX * 2;
+    ctx.fillStyle = 'rgba(10,10,18,0.45)';
+    roundRect(ctx, x, y - h + 2, w, h, 8);
+    ctx.fill();
+    ctx.fillStyle = color;
+    ctx.fillText(text, x + padX, y - 6);
+  }
+  function roundRect(c, x, y, w, h, r) {
+    c.beginPath();
+    c.moveTo(x + r, y);
+    c.arcTo(x + w, y, x + w, y + h, r);
+    c.arcTo(x + w, y + h, x, y + h, r);
+    c.arcTo(x, y + h, x, y, r);
+    c.arcTo(x, y, x + w, y, r);
+    c.closePath();
+  }
+
+  // ---------- Hand metrics ----------
+  function computeHandMetrics(landmarks) {
+    const wrist = landmarks[0];
+    const middleTip = landmarks[12];
+    const growRaw = dist(wrist, middleTip);
+    const grow = clamp((growRaw - 0.12) / (0.30 - 0.12), 0, 1);
+
+    const thumbTip = landmarks[4];
+    const pinkyTip = landmarks[20];
+    const bloomRaw = dist(thumbTip, pinkyTip);
+    const bloom = clamp((bloomRaw - 0.06) / (0.26 - 0.06), 0, 1);
+
+    return { grow, bloom, wrist };
+  }
+
+  // ---------- MediaPipe Hands (tuned for speed) ----------
+  const hands = new Hands({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+  });
+  hands.setOptions({
+    maxNumHands: 2,
+    modelComplexity: 0,          // lite model — noticeably faster inference
+    minDetectionConfidence: 0.5,
+    minTrackingConfidence: 0.5,
+  });
+
+  let latestResults = null;
+  let processing = false;
+  hands.onResults((results) => { latestResults = results; processing = false; });
+
+  function startCamera() {
+    sizeCanvas();
+    const camera = new Camera(video, {
+      onFrame: async () => {
+        // skip sending a new frame if the previous one hasn't resolved yet —
+        // prevents the hand-tracking queue backing up and lagging behind
+        if (processing) return;
+        processing = true;
+        await hands.send({ image: video });
+      },
+      width: 480,
+      height: 640,
+    });
+    camera.start();
+    requestAnimationFrame(loop);
+  }
+
+  // ---------- Main loop ----------
+  let lastT = performance.now();
+  const clockStart = performance.now();
+  function loop() {
+    requestAnimationFrame(loop);
+    const now = performance.now();
+    const dt = Math.min(0.05, (now - lastT) / 1000);
+    lastT = now;
+    const time = (now - clockStart) / 1000;
+
+    ctx.clearRect(0, 0, W, H);
+    drawDust(time);
+
+    let handsFound = 0;
+    let growSum = 0, bloomSum = 0;
+    const labelsToDraw = [];
+
+    if (latestResults && latestResults.multiHandLandmarks) {
+      handsFound = latestResults.multiHandLandmarks.length;
+      latestResults.multiHandLandmarks.forEach((landmarks, idx) => {
+        const { grow, bloom, wrist } = computeHandMetrics(landmarks);
+        growSum += grow;
+        bloomSum += bloom;
+
+        const sx = (1 - wrist.x) * W;
+        const sy = wrist.y * H;
+
+        if (idx % 2 === 0) {
+          labelsToDraw.push({ text: `Grow ${grow.toFixed(2)}`, x: sx + 16, y: sy, color: 'rgba(255,255,255,0.95)' });
+        } else {
+          labelsToDraw.push({ text: `Bloom ${bloom.toFixed(2)}`, x: sx + 16, y: sy, color: 'rgba(255,170,205,0.95)' });
+        }
+        drawDiamond(sx, sy - 44, 11, 0.55 + 0.35 * Math.sin(time * 2 + idx), time * 0.6);
+      });
+    }
+
+    // snappier response: higher lerp factor = reacts faster to hand changes
+    const targetGrow = handsFound ? growSum / handsFound : smoothGrow * 0.97;
+    const targetBloom = handsFound ? bloomSum / handsFound : smoothBloom * 0.97;
+    smoothGrow = lerp(smoothGrow, targetGrow, 0.22);
+    smoothBloom = lerp(smoothBloom, targetBloom, 0.22);
+
+    stems.forEach((stem) => {
+      stem.bloom = lerp(stem.bloom, smoothBloom, 0.18);
+      const pts = buildStemPath(stem, smoothGrow, time, dt);
+      drawLeaves(pts, stem, smoothGrow);
+      strokeStemGlowAndCrisp(pts);
+      const tip = pts[pts.length - 1];
+      drawTulip(tip.x, tip.y, stem);
+
+      if (stem.bloom > 0.45 && Math.random() < stem.bloom * 0.06) {
+        spawnParticle(tip.x + (Math.random() - 0.5) * 16, tip.y - 10, stem.pinkAmount > 0.5);
+      }
+    });
+
+    updateParticles(dt);
+    drawParticles();
+    labelsToDraw.forEach((l) => drawLabel(l.text, l.x, l.y, l.color));
+
+    statusEl.textContent = handsFound
+      ? `Grow ${smoothGrow.toFixed(2)}  ·  Bloom ${smoothBloom.toFixed(2)}`
+      : 'Show your hands to the camera';
+  }
+
+  startBtn.addEventListener('click', async () => {
+    try {
+      startBtn.querySelector('.sub').textContent = 'Requesting camera…';
+      await navigator.mediaDevices.getUserMedia({ video: true });
+      startBtn.style.display = 'none';
+      startCamera();
+    } catch (err) {
+      startBtn.querySelector('.sub').textContent = 'Camera access denied — check browser settings';
+    }
+  });
+
+  sizeCanvas();
+})();
+</script>
+</body>
+</html>
